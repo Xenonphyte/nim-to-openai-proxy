@@ -1,4 +1,5 @@
 // server.js - Hybrid OpenAI ↔ NIM Proxy
+// Fixed: stream death, JSON vomit, silent buffer loss, missing error propagation
 
 const express = require('express');
 const cors = require('cors');
@@ -10,14 +11,14 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use((req, res, next) => {
-  // Allow unauthenticated endpoints
   if (req.path === '/health' || req.path === '/v1/models') {
     return next();
   }
 
   const auth = req.headers.authorization?.trim();
+  const expected = `Bearer ${process.env.CLIENT_AUTH_KEY}`;
 
-  if (!auth || auth.localeCompare(`Bearer ${process.env.CLIENT_AUTH_KEY}`) !== 0) {
+  if (!auth || auth.localeCompare(expected) !== 0) {
     return res.status(403).json({
       error: {
         message: 'Forbidden',
@@ -33,10 +34,15 @@ app.use((req, res, next) => {
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-const SHOW_REASONING = false;
-const ENABLE_THINKING_MODE = false;
+// Toggles - env-configurable for phone-editing at 2am
+const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
+const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 
-// Model mapping
+const MAX_TOKENS_LIMIT = 32768;
+
+if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
+if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
+
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
   'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
@@ -59,7 +65,6 @@ const MODEL_MAPPING = {
   'step-3.5-flash': 'stepfun-ai/step-3.5-flash'
 };
 
-// Fallback chain
 const FALLBACK_MODELS = [
   'mistralai/mistral-medium-3.5-128b',
   'mistralai/mistral-small-4-119b-2603',
@@ -67,12 +72,10 @@ const FALLBACK_MODELS = [
   'google/gemma-4-31b-it'
 ];
 
-// Health
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// Models
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
@@ -85,7 +88,6 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-// 🔥 Core request with fallback
 async function callWithFallback(baseRequest, models) {
   for (const model of models) {
     try {
@@ -103,38 +105,34 @@ async function callWithFallback(baseRequest, models) {
       );
       return { response: res, model };
     } catch (err) {
-      console.warn(`Model failed: ${model}`, err.response?.status);
+      console.warn(`[FALLBACK] Model failed: ${model}`, err.response?.status, err.response?.data?.error?.message || err.message);
     }
   }
   throw new Error('All models failed');
 }
 
-// Chat endpoint
 app.post('/v1/chat/completions', async (req, res) => {
+  let streamEndedCleanly = false;
+
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    const primaryModel =
-      MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
-
+    const primaryModel = MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
     const modelChain = [primaryModel, ...FALLBACK_MODELS];
 
     const baseRequest = {
       messages,
       temperature: temperature ?? 0.7,
-      max_tokens: Math.min(max_tokens ?? 2048, 32768),
+      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
       stream: stream || false,
       extra_body: ENABLE_THINKING_MODE
         ? { chat_template_kwargs: { thinking: true } }
         : undefined
     };
 
-    const { response, model: usedModel } =
-      await callWithFallback(baseRequest, modelChain);
+    const { response, model: usedModel } = await callWithFallback(baseRequest, modelChain);
+    console.log("[PROXY] Model used:", usedModel);
 
-    console.log("MODEL USED:", usedModel);
-
-    // ================= STREAM =================
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -142,6 +140,51 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       let buffer = '';
       let reasoningOpen = false;
+      let doneSent = false;
+
+      const processLine = (line) => {
+        if (!line.startsWith('data: ')) return;
+
+        if (line.includes('[DONE]')) {
+          if (!doneSent) {
+            res.write('data: [DONE]\n\n');
+            doneSent = true;
+          }
+          streamEndedCleanly = true;
+          return;
+        }
+
+        try {
+          const data = JSON.parse(line.slice(6));
+          const delta = data.choices?.[0]?.delta;
+
+          if (delta) {
+            let content = delta.content || '';
+            const reasoning = delta.reasoning_content;
+
+            if (SHOW_REASONING) {
+              if (reasoning && !reasoningOpen) {
+                content = `<think>\n${reasoning}`;
+                reasoningOpen = true;
+              } else if (reasoning) {
+                content = reasoning;
+              }
+
+              if (delta.content && reasoningOpen) {
+                content += `<think>\n\n${delta.content}`;
+                reasoningOpen = false;
+              }
+            }
+
+            delta.content = content;
+            delete delta.reasoning_content;
+          }
+
+          res.write(`data: ${JSON.stringify(data)}\n\n`);
+        } catch (parseErr) {
+          console.warn('[STREAM] Skipped invalid JSON line:', line.slice(0, 100));
+        }
+      };
 
       response.data.on('data', chunk => {
         buffer += chunk.toString();
@@ -149,67 +192,55 @@ app.post('/v1/chat/completions', async (req, res) => {
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-
-          if (line.includes('[DONE]')) {
-            res.write('data: [DONE]\n\n');
-            res.end();
-            return;
-          }
-
-          try {
-            const data = JSON.parse(line.slice(6));
-            const delta = data.choices?.[0]?.delta;
-
-            if (delta) {
-              let content = delta.content || '';
-              const reasoning = delta.reasoning_content;
-
-              if (SHOW_REASONING) {
-                if (reasoning && !reasoningOpen) {
-                  content = `<think>\n${reasoning}`;
-                  reasoningOpen = true;
-                } else if (reasoning) {
-                  content = reasoning;
-                }
-
-                if (delta.content && reasoningOpen) {
-                  content += `</think>\n\n${delta.content}`;
-                  reasoningOpen = false;
-                }
-              }
-
-              delta.content = content;
-              delete delta.reasoning_content;
-            }
-
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
-          } catch {
-            res.write(line + '\n');
-          }
+          processLine(line);
         }
       });
 
-      response.data.on('end', () => res.end());
-      response.data.on('error', err => {
-        console.error('Stream error:', err);
+      response.data.on('end', () => {
+        if (buffer.trim()) {
+          console.warn('[STREAM] Processing leftover buffer at end:', buffer.slice(0, 100));
+          for (const line of buffer.split('\n')) {
+            processLine(line);
+          }
+        }
+
+        if (!doneSent) {
+          res.write('data: [DONE]\n\n');
+        }
+
+        streamEndedCleanly = true;
         res.end();
       });
 
-    // ================= NON-STREAM =================
+      response.data.on('error', err => {
+        console.error('[STREAM] Upstream error:', err.message);
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify({ error: { message: 'Stream interrupted', type: 'stream_error' } })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }
+      });
+
+      req.on('close', () => {
+        if (!streamEndedCleanly) {
+          console.warn('[STREAM] Client disconnected prematurely');
+        }
+        if (response.data && !response.data.destroyed) {
+          response.data.destroy();
+        }
+      });
+
     } else {
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
-        model: model, // return requested model
+        model: model,
         choices: (response.data.choices || []).map((choice, i) => {
           let content = choice.message?.content || '';
 
           if (SHOW_REASONING && choice.message?.reasoning_content) {
-            content =
-              `<think>\n${choice.message.reasoning_content}\n</think>\n\n` +
-              content;
+            content = `<think>\n${choice.message.reasoning_content}\n<think>\n\n${content}`;
           }
 
           return {
@@ -233,20 +264,25 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('Proxy error:', error.message);
-    console.error('NIM ERROR:', error.response?.data);
+    console.error('[PROXY] Fatal error:', error.message);
+    console.error('[PROXY] NIM response:', error.response?.data);
 
-    res.status(error.response?.status || 500).json({
-      error: {
-        message: error.message,
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
-    });
+    if (!res.headersSent) {
+      res.status(error.response?.status || 500).json({
+        error: {
+          message: error.message,
+          type: 'invalid_request_error',
+          code: error.response?.status || 500
+        }
+      });
+    } else if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: { message: error.message, type: 'proxy_error' } })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
   }
 });
 
-// Fallback
 app.all('*', (req, res) => {
   res.status(404).json({
     error: {
@@ -258,5 +294,6 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Hybrid proxy running on port ${PORT}`);
+  console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
+  console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
 });

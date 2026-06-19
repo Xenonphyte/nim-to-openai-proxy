@@ -306,8 +306,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       tool_choice: req.body.tool_choice,
       response_format: req.body.response_format,
       extra_body: ENABLE_THINKING_MODE
-    ? { chat_template_kwargs: { thinking: true } }
-    : undefined
+        ? { chat_template_kwargs: { thinking: true } }
+        : undefined
 };
     
 
